@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: etsy-postgres
+    environment:
+      POSTGRES_DB: etsybot
+      POSTGRES_USER: etsyuser
+      POSTGRES_PASSWORD: etS_yP@ss
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    container_name: etsy-redis
+    ports:
+      - "6379:6379"
+
+  bot:
+    build: .
+    container_name: etsy-bot
+    depends_on:
+      - postgres
+      - redis
+    env_file: .env
+    volumes:
+      - .:/app
+    command: bash scripts/start_services.sh
+
+volumes:
+  pgdata:
+
