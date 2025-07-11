@@ -29,4 +29,4 @@ async def scrape_listing_page(listing_url: str) -> dict:
         'price': price_tag['content'] if price_tag else '?',
         'currency': currency_tag['content'] if currency_tag else '',
         'thumbnail': img_tag['content'] if img_tag else None,
-    }==-=-=-==--=--=--=-=--=-=-=-=-
+    }

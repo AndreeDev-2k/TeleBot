@@ -1,7 +1,6 @@
-#!/bin/bash
+python3 -m bot.bot &
 
-# Chạy Telegram bot và poller ở background
-nohup python3 src/bot/bot.py > bot.log 2>&1 &
-nohup python3 src/poller/poller.py > poller.log 2>&1 &
-
-echo "Bot và Poller đã được khởi động."
+until python3 -m poller.poller; do
+	 echo "Poller crashed. Restart in 10s"
+	 sleep 10
+done
