@@ -34,3 +34,4 @@ USER appuser
 # Lệnh khởi động
 CMD ["bash", "scripts/start_services.sh"]
 
+

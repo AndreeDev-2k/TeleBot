@@ -21,4 +21,9 @@ async def on_startup(dispatcher):
     register_handlers()
 
 if __name__ == '__main__':
+<<<<<<< HEAD
     executor.start_polling(dp, on_startup=on_startup)
+=======
+    executor.start_polling(dp, on_startup=on_startup)
+
+>>>>>>> 8058252 ( local changes)
