@@ -15,9 +15,10 @@ def register_handlers():
     dp.register_message_handler(cmd_list, commands=['list'])
 
 async def on_startup(dispatcher):
-    dispatcher['pg'] = await init_pg_pool()
+    pool = await init_pg_pool()
+    dispatcher["pg"] = pool
+    dispatcher.bot['pg'] = pool
     register_handlers()
 
 if __name__ == '__main__':
     executor.start_polling(dp, on_startup=on_startup)
-

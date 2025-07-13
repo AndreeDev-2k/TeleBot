@@ -1,10 +1,15 @@
-version: '3.8'
 
 services:
   postgres:
     image: postgres:15-alpine
-    container_name: etsy-postgres
-    environment:
+    container_name: esty-postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    environment: 
+
       POSTGRES_DB: etsybot
       POSTGRES_USER: etsyuser
       POSTGRES_PASSWORD: etS_yP@ss
@@ -17,19 +22,35 @@ services:
   redis:
     image: redis:7-alpine
     container_name: etsy-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
     ports:
       - "6379:6379"
 
   bot:
     build: .
     container_name: etsy-bot
-    depends_on:
-      - postgres
-      - redis
     env_file: .env
-    volumes:
-      - .:/app
-    command: bash scripts/start_services.sh
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: python3 -m bot.bot
+
+  poller:
+    build: .
+    container_name: etsy-poller
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: python3 -m poller.poller
 
 volumes:
   pgdata:
