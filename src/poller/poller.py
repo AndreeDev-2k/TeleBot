@@ -1,70 +1,72 @@
 import asyncio
-import time
-from datetime import datetime
+from datetime import datetime, date, time, timedelta
+import feedparser
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from pytz import timezone
 
-from db.postgres import init_pg_pool, get_all_shops, get_subscribers_for_shop
-from api.client import fetch_latest_from_rss, scrape_listing_page
-from db.redis_client import (get_seen_ids, add_seen_id, get_last_run, set_last_run)
+from db.postgres import init_pg_pool, get_all_group_ids, get_shops_for_group
+from api.client import scrape_listing_page
 from notifier.telegram_client import send_message
 
-async def worker(pg_pool, semaphore):
-    shops = await get_all_shops(pg_pool)
-    tasks = []
+# Timezone Asia/Bangkok
+TZ = timezone("Asia/Bangkok")
 
-    for shop in shops:
-        async with semaphore:
-            basic = await fetch_latest_from_rss(shop)
-            if not basic:
-                continue
+def get_prev_day_window():
+    today = datetime.now(TZ).date()
+    start = datetime.combine(today - timedelta(days=1), time(0, 0), tzinfo=TZ)
+    end   = datetime.combine(today,             time(0, 0), tzinfo=TZ)
+    return start, end
 
-            try:
-                pub_ts = datetime.strptime(basic["pub_date"], "%Y-%m-%d %H:%M").timestamp()
-            except Exception:
-                pub_ts = 0.0
+async def count_listings_between(shop_name: str, start: datetime, end: datetime) -> int:
+    url = f"https://www.etsy.com/shop/{shop_name}/rss"
+    feed = feedparser.parse(url)
+    count = 0
 
-            last_run = await get_last_run(shop) or 0.0
-            if pub_ts <= last_run:
-                return
+    for entry in feed.entries:
+        link = entry.link
+        if "/listing/" not in link:
+            continue
+        details = await scrape_listing_page(link)
+        date_str = details.get("create_date")
+        try:
+            dt = datetime.fromisoformat(date_str)
+            if dt.tzinfo is None:
+                dt = TZ.localize(dt)
+            else:
+                dt = dt.astimezone(TZ)
+        except Exception:
+            continue
 
-            seen = await get_seen_ids(shop_name)
-            listing_id = basic["listing_id"]
-       
-            if listing_id not in seen:
-                # Listing mới hoàn toàn
-                details = await scrape_listing_page(basic["url"])
+        if start <= dt < end:
+            count += 1
 
-                create_date = details.get("create_date") or basic["pub_date"]
+    return count
 
-                # Gộp thông tin
-                listing = {
-                    "listing_id": listing_id,
-                    "title": basic["title"],
-                    "price": details["price"],
-                    "currency": detail["currency"],
-                    "url": basic["url"],
-                    "thumbnail": details["thumbnail"],
-                    "create_date": create_date,
-                }
-
-                chat_ids = await get_subcribers_for_shop(pg_pool, shop_name)
-                if chat_ids:
-                    await notify_listing(shop_name, listing, chat_ids)
-
-                await add_seen_id(shop_name, listing_id)
-
-            await set_last_run(shop_name, time.time())
-
-        task.append(check(shop))
-
-    await asyncio.gather(*tasks)
-
-
-async def main():
+async def send_daily_summary():
     pg_pool = await init_pg_pool()
-    semaphore = asyncio.Semaphore(10)
-    while True:
-        await worker(pg_pool, semaphore)
-        await asyncio.sleep(60)
+    start, end = get_prev_day_window()
+    label = start.strftime("%Y-%m-%d")
 
-if __name__ == '__main__':
-    asyncio.run(main())
+    group_ids = await get_all_group_ids(pg_pool)
+    for group_id in group_ids:
+        shops = await get_shops_for_group(pg_pool, group_id)
+        lines = []
+        for shop in shops:
+            cnt = await count_listings_between(shop, start, end)
+            lines.append(f"• {shop}: {cnt} sản phẩm mới ngày {label}")
+
+        if not lines:
+            text = f"📊 Báo cáo ngày {label}:\nNhóm chưa theo dõi shop nào."
+        else:
+            text = "📊 *Báo cáo ngày* " + label + ":\n\n" + "\n".join(lines)
+
+        await send_message(group_id, text)
+
+def main():
+    scheduler = AsyncIOScheduler(timezone="Asia/Bangkok")
+    scheduler.add_job(send_daily_summary, "cron", hour=7, minute=0)
+    scheduler.start()
+    asyncio.get_event_loop().run_forever()
+
+if __name__ == "__main__":
+    main()
