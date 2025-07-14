@@ -10,7 +10,7 @@ from db.postgres import (
     get_shops_for_group,
 )
 from db.redis_client import get_seen_ids, add_seen_id
-from api.client import fetch_latest_from_rss, scrape_listing_page
+from etsy.rss_client import fetch_latest_from_rss, scrape_listing_page
 from notifier.telegram_client import send_message
 
 # Thời gian tối thiểu để tính “24h qua” (UTC)
