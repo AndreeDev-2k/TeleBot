@@ -33,6 +33,7 @@ async def add_shop(pg_pool, shop_name: str):
             shop_name
         )
         if rec:
+            print(f"[+] Đã thêm shop mới vào database: {shop_name}")
             return rec['id']
         # Nếu đã tồn tại, lấy lại id
         rec2 = await con.fetchrow(

@@ -1,70 +1,96 @@
 import asyncio
-import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
-from db.postgres import init_pg_pool, get_all_shops, get_subscribers_for_shop
+import feedparser
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from db.postgres import (
+    init_pg_pool,
+    get_all_group_ids,
+    get_shops_for_group,
+)
+from db.redis_client import get_seen_ids, add_seen_id
 from api.client import fetch_latest_from_rss, scrape_listing_page
-from db.redis_client import (get_seen_ids, add_seen_id, get_last_run, set_last_run)
 from notifier.telegram_client import send_message
 
-async def worker(pg_pool, semaphore):
-    shops = await get_all_shops(pg_pool)
-    tasks = []
+# Thời gian tối thiểu để tính “24h qua” (UTC)
+def utc_cutoff(hours: int = 24) -> datetime:
+    return datetime.now(timezone.utc) - timedelta(hours=hours)
 
-    for shop in shops:
-        async with semaphore:
-            basic = await fetch_latest_from_rss(shop)
-            if not basic:
-                continue
+async def count_and_mark_new(shop_name: str, cutoff: datetime) -> int:
+    """
+    - Đọc RSS feed của shop.
+    - Với mỗi entry, tách listing_id.
+    - Nếu listing_id chưa seen, scrape JSON‑LD để lấy datePublished.
+    - Nếu datePublished >= cutoff, đếm vào và mark seen.
+    """
+    seen: set[str] = await get_seen_ids(shop_name)
+    new_count = 0
 
-            try:
-                pub_ts = datetime.strptime(basic["pub_date"], "%Y-%m-%d %H:%M").timestamp()
-            except Exception:
-                pub_ts = 0.0
+    feed = feedparser.parse(f"https://www.etsy.com/shop/{shop_name}/rss")
+    for entry in feed.entries:
+        link = entry.link
+        if "/listing/" in link:
+            listing_id = link.rstrip("/").split("/")[-2]
+        else:
+            continue
 
-            last_run = await get_last_run(shop) or 0.0
-            if pub_ts <= last_run:
-                return
+        if listing_id in seen:
+            continue
 
-            seen = await get_seen_ids(shop_name)
-            listing_id = basic["listing_id"]
-       
-            if listing_id not in seen:
-                # Listing mới hoàn toàn
-                details = await scrape_listing_page(basic["url"])
+        details = await scrape_listing_page(link)
+        date_str = details.get("create_date")
+        try:
+            dt = datetime.fromisoformat(date_str)
+        except Exception:
+            continue
 
-                create_date = details.get("create_date") or basic["pub_date"]
+        if dt >= cutoff:
+            new_count += 1
+            await add_seen_id(shop_name, listing_id)
 
-                # Gộp thông tin
-                listing = {
-                    "listing_id": listing_id,
-                    "title": basic["title"],
-                    "price": details["price"],
-                    "currency": detail["currency"],
-                    "url": basic["url"],
-                    "thumbnail": details["thumbnail"],
-                    "create_date": create_date,
-                }
+    return new_count
 
-                chat_ids = await get_subcribers_for_shop(pg_pool, shop_name)
-                if chat_ids:
-                    await notify_listing(shop_name, listing, chat_ids)
-
-                await add_seen_id(shop_name, listing_id)
-
-            await set_last_run(shop_name, time.time())
-
-        task.append(check(shop))
-
-    await asyncio.gather(*tasks)
-
-
-async def main():
+async def send_daily_summary():
+    """
+    Job báo cáo hàng ngày cho mỗi group lúc 07:00 Asia/Bangkok.
+    """
     pg_pool = await init_pg_pool()
-    semaphore = asyncio.Semaphore(10)
-    while True:
-        await worker(pg_pool, semaphore)
-        await asyncio.sleep(60)
+    cutoff = utc_cutoff(24)
+    today = datetime.now().strftime("%Y-%m-%d")
 
-if __name__ == '__main__':
-    asyncio.run(main())
+    group_ids = await get_all_group_ids(pg_pool)
+    for group_id in group_ids:
+        shops = await get_shops_for_group(pg_pool, group_id)
+        lines = []
+        for shop in shops:
+            cnt = await count_and_mark_new(shop, cutoff)
+            lines.append(f"• {shop}: {cnt} sản phẩm mới trong 24h qua")
+
+        if not lines:
+            text = (
+                f"📊 Báo cáo hàng ngày ({today}):\n"
+                "Nhóm chưa theo dõi shop nào."
+            )
+        else:
+            text = (
+                f"📊 *Báo cáo hàng ngày* ({today}):\n\n" +
+                "\n".join(lines)
+            )
+
+        await send_message(group_id, text)
+
+def main():
+    # Tạo trước event loop
+    loop = asyncio.get_event_loop()
+
+    # Khởi AsyncIOScheduler với loop đó
+    scheduler = AsyncIOScheduler(event_loop=loop, timezone="Asia/Bangkok")
+    scheduler.add_job(send_daily_summary, "cron", hour=7, minute=0)
+    scheduler.start()
+
+    # Giữ loop chạy liên tục
+    loop.run_forever()
+
+if __name__ == "__main__":
+    main()

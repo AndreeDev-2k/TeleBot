@@ -15,6 +15,8 @@ async def cmd_start(message: types.Message):
         "/unfollow <shop> — nhóm bỏ theo dõi\n"
         "/list — xem shop nhóm đang theo dõi"
     )
+    print(f"[+] Bot đã được thêm vào nhóm: (ID: {chat_id})")
+    
 
 async def cmd_follow(message: types.Message):
     shop = message.get_args().strip()
