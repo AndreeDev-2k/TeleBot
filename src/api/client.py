@@ -45,4 +45,3 @@ async def scrape_listing_page(listing_url: str) -> dict:
             'thumbnail': img_tag['content'] if img_tag else None,
             'create_date': create_date or 'Unknown'
     }
-error: cannot format -: Cannot parse: 33:91:         meta_created = soup.find('meta', attrs={'property': 'etsym:original_publish_date'}) \ 

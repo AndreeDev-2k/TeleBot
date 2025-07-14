@@ -20,3 +20,17 @@ CREATE TABLE last_seen (
 	  listing_id TEXT NOT NULL,
 	  seen_at TIMESTAMP DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS groups (
+	  id          SERIAL      PRIMARY KEY,
+	  chat_id     BIGINT      UNIQUE NOT NULL,
+	  created_at  TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS group_subscriptions (
+	  group_id    INTEGER     NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+	  shop_name   TEXT        NOT NULL,
+	  created_at  TIMESTAMPTZ DEFAULT now(),
+	  PRIMARY KEY (group_id, shop_name)
+);
+
