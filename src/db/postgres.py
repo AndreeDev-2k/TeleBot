@@ -1,124 +1,205 @@
 import asyncpg
+from typing import List, Tuple, Set
 from config.settings import settings
 
-async def init_pg_pool():
+async def init_pg_pool() -> asyncpg.Pool:
+    """
+    Khởi tạo connection pool đến PostgreSQL.
+    """
     return await asyncpg.create_pool(dsn=settings.DATABASE_URL)
 
-async def add_group(pg_pool, chat_id: int):
+# ── XỬ LÝ SHOPS ───────────────────────────────────────────────────────────────
+async def import_shops_from_csv(pg_pool, shops: List[Tuple[str, int]]) -> None:
     """
-    Thêm một group chat nếu chưa tồn tại.
+    Import danh sách shops từ CSV (shop_name, shop_id).
+    """
+    async with pg_pool.acquire() as con:
+        await con.executemany(
+            """
+            INSERT INTO shops (shop_name, shop_id)
+            VALUES ($1, $2)
+            ON CONFLICT (shop_name) DO UPDATE
+              SET shop_id = EXCLUDED.shop_id;
+            """,
+            shops
+        )
+
+async def get_all_shops(pg_pool) -> List[Tuple[str, int]]:
+    """
+    Trả về toàn bộ danh sách shops.
+    """
+    async with pg_pool.acquire() as con:
+        rows = await con.fetch(
+            "SELECT shop_name, shop_id FROM shops;"
+        )
+    return [(r['shop_name'], r['shop_id']) for r in rows]
+
+# ── XỬ LÝ seen_ids ────────────────────────────────────────────────────────────
+async def ensure_seen_table(pg_pool) -> None:
+    """
+    Tạo bảng seen_ids nếu chưa có.
     """
     async with pg_pool.acquire() as con:
         await con.execute(
-            '''
-            INSERT INTO groups (chat_id)
-            VALUES ($1)
-            ON CONFLICT (chat_id) DO NOTHING
-            ''',
-            chat_id
+            """
+            CREATE TABLE IF NOT EXISTS seen_ids (
+              shop_name   TEXT NOT NULL,
+              listing_id  TEXT NOT NULL,
+              seen_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (shop_name, listing_id)
+            );
+            """
         )
 
-async def add_shop(pg_pool, shop_name: str):
+async def add_seen_id(pg_pool, shop_name: str, listing_id: str) -> bool:
     """
-    Đảm bảo shop tồn tại trong bảng shops, trả về shop_id.
+    Ghi nhận listing đã xem, trả về True nếu chèn mới.
     """
     async with pg_pool.acquire() as con:
-        rec = await con.fetchrow(
-            '''
-            INSERT INTO shops (shop_name)
-            VALUES ($1)
-            ON CONFLICT (shop_name) DO NOTHING
-            RETURNING id
-            ''',
+        result = await con.execute(
+            """
+            INSERT INTO seen_ids (shop_name, listing_id)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING;
+            """,
+            shop_name, listing_id
+        )
+    # asyncpg.execute returns e.g. 'INSERT 0 1' if inserted
+    return result.split()[-1] == '1'
+
+async def get_seen_ids(pg_pool, shop_name: str) -> Set[str]:
+    """
+    Lấy tập listing_id đã seen cho shop.
+    """
+    async with pg_pool.acquire() as con:
+        rows = await con.fetch(
+            "SELECT listing_id FROM seen_ids WHERE shop_name = $1;",
             shop_name
         )
-        if rec:
-            print(f"[+] Đã thêm shop mới vào database: {shop_name}")
-            return rec['id']
-        # Nếu đã tồn tại, lấy lại id
-        rec2 = await con.fetchrow(
-            'SELECT id FROM shops WHERE shop_name=$1', shop_name
-        )
-        return rec2['id']
+    return {r['listing_id'] for r in rows}
 
-async def subscribe_group(pg_pool, chat_id: int, shop_name: str):
+# ── XỬ LÝ NHÓM & SUBSCRIPTIONS ─────────────────────────────────────────────────
+async def init_groups_tables(pg_pool) -> None:
     """
-    Cho group chat theo dõi một shop.
+    Tạo hoặc migrate các bảng groups, shops, group_subscriptions nếu chưa.
     """
-    # Đảm bảo group và shop đã tồn tại
-    await add_group(pg_pool, chat_id)
-    await add_shop(pg_pool, shop_name)
+    async with pg_pool.acquire() as con:
+
+        # Bảng groups
+        await con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS groups (
+                id          SERIAL PRIMARY KEY,
+                chat_id     BIGINT    NOT NULL UNIQUE,
+                chat_title  TEXT,
+                created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                deleted_at   TIMESTAMPTZ
+            );
+            """  
+        )
+        # Bảng shops
+        await con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shops (
+                shop_name TEXT PRIMARY KEY,
+                shop_id   BIGINT NOT NULL
+            );
+            """
+        )
+        # Bảng group_subscriptions
+        await con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS group_subscriptions (
+                id            SERIAL PRIMARY KEY,
+                chat_id       BIGINT    NOT NULL REFERENCES groups(chat_id) ON DELETE CASCADE,
+                shop_name     TEXT      NOT NULL REFERENCES shops(shop_name) ON DELETE CASCADE,
+                shop_id       BIGINT    NOT NULL REFERENCES shops(shop_id) ON DELETE CASCADE,
+                created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+                deleted_at     TIMESTAMPTZ,
+                UNIQUE (chat_id, shop_name)
+            );
+            """
+        )
+
+
+async def add_group(pg_pool, chat_id: int, chat_title: str) -> None:
+    """
+    Ghi nhận bot được thêm vào group/chat riêng.
+    """
     async with pg_pool.acquire() as con:
         await con.execute(
-            '''
-            INSERT INTO group_subscriptions (group_id, shop_name)
-            VALUES (
-                (SELECT id FROM groups WHERE chat_id=$1),
-                $2
+            """
+            INSERT INTO groups (chat_id, chat_title)
+            VALUES ($1, $2)
+            ON CONFLICT (chat_id) DO UPDATE SET
+                chat_title = EXCLUDED.chat_title,
+                updated_at = now(),
+                deleted_at = NULL
+            """,
+            chat_id, chat_title
+        )
+
+async def subscribe_group(pg_pool, chat_id: int, shop_name: str, shop_id: int) -> None:
+    """
+    Đăng ký shop cho group.
+    """
+    async with pg_pool.acquire() as con:
+        # Đảm bảo group tồn tại
+        await con.execute(
+            "INSERT INTO groups (chat_id) VALUES ($1) ON CONFLICT DO NOTHING;",
+            chat_id
+        )
+        # Đảm bảo shop tồn tại và cập nhật shop_id nếu cần
+        await con.execute(
+            """
+            INSERT INTO shops (shop_name, shop_id)
+            VALUES ($1, $2)
+            ON CONFLICT (shop_name) DO UPDATE SET shop_id = EXCLUDED.shop_id;
+            """,
+            shop_name, shop_id
+        )
+        # Thêm subscription
+        try:
+            await con.execute(
+                "INSERT INTO group_subscriptions (chat_id, shop_name, shop_id) VALUES ($1, $2, $3);",
+                chat_id, shop_name, shop_id
             )
-            ON CONFLICT DO NOTHING
-            ''',
-            chat_id, shop_name
-        )
+        except asyncpg.exceptions.UniqueViolationError:
+            # subscription already exists
+            pass
 
-async def unsubscribe_group(pg_pool, chat_id: int, shop_name: str):
+async def unsubscribe_group(pg_pool, chat_id: int, shop_name: str) -> None:
     """
-    Hủy theo dõi shop cho group chat.
+    Hủy đăng ký shop khỏi group.
     """
     async with pg_pool.acquire() as con:
         await con.execute(
-            '''
-            DELETE FROM group_subscriptions
-            WHERE group_id = (SELECT id FROM groups WHERE chat_id=$1)
-              AND shop_name = $2
-            ''',
+            "DELETE FROM group_subscriptions WHERE chat_id = $1 AND shop_name = $2;",
             chat_id, shop_name
         )
 
-async def get_shops_for_group(pg_pool, chat_id: int) -> list[str]:
+async def get_shops_for_group(pg_pool, chat_id: int) -> List[Tuple[str, int]]:
     """
-    Lấy danh sách shop mà một group đang theo dõi.
+    Trả về danh sách (shop_name, shop_id) cho group.
     """
     async with pg_pool.acquire() as con:
         rows = await con.fetch(
-            '''
-            SELECT sub.shop_name
-            FROM group_subscriptions sub
-            JOIN groups g ON g.id = sub.group_id
-            WHERE g.chat_id = $1
-            ''',
+            """
+            SELECT s.shop_name, s.shop_id
+              FROM group_subscriptions gs
+              JOIN shops s ON s.shop_name = gs.shop_name
+             WHERE gs.chat_id = $1;
+            """,
             chat_id
         )
-    return [r['shop_name'] for r in rows]
+    return [(r['shop_name'], r['shop_id']) for r in rows]
 
-async def get_all_shops(pg_pool) -> list[str]:
+async def get_all_group_ids(pg_pool) -> List[int]:
     """
-    Lấy tất cả shop có trong hệ thống.
+    Trả về list tất cả chat_id đã đăng ký.
     """
     async with pg_pool.acquire() as con:
-        rows = await con.fetch('SELECT shop_name FROM shops')
-    return [r['shop_name'] for r in rows]
-
-async def get_groups_for_shop(pg_pool, shop_name: str) -> list[int]:
-    """
-    Lấy danh sách chat_id của các group đang theo dõi một shop.
-    """
-    async with pg_pool.acquire() as con:
-        rows = await con.fetch(
-            '''
-            SELECT g.chat_id
-            FROM group_subscriptions sub
-            JOIN groups g ON g.id = sub.group_id
-            WHERE sub.shop_name = $1
-            ''',
-            shop_name
-        )
-    return [r['chat_id'] for r in rows]
-
-async def get_all_group_ids(pg_pool) -> list[int]:
-    """
-    Lấy tất cả chat_id của groups đã đăng ký.
-    """
-    async with pg_pool.acquire() as con:
-        rows = await con.fetch('SELECT chat_id FROM groups')
+        rows = await con.fetch("SELECT chat_id FROM groups;")
     return [r['chat_id'] for r in rows]

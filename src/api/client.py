@@ -1,47 +1,64 @@
-import feedparser
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 import aiohttp
-from bs4 import BeautifulSoup
+from typing import List, Dict, Optional
 
-async def fetch_latest_from_rss(shop_name: str) -> dict | None:
-     url = f"https://www.etsy.com/shop/{shop_name}/rss"
-     feed = feedparser.parse(url)
-     if not feed.entries:
-         return None
-     entry = feed.entries[0]
-     link = entry.link
-     listing_id = str(link).rstrip('/').split('/')[-2] if '/listing/' in str(link) else entry.id
-     if isinstance(entry.published_parsed, tuple):
-        pub_date = datetime(*entry.published_parsed[:6]).strftime('%Y-%m-%d %H:%M')
-     else:
-        pub_date = "Unknown"
-     return {'listing_id': listing_id, 'title': entry.title, 'link': link, 'pub_date': pub_date}
+BASE = "https://www.etsy.com"
 
-async def scrape_listing_page(listing_url: str) -> dict:
+async def get_shop_id(session: aiohttp.ClientSession, shop_name: str) -> Optional[str]:
+    url = f"{BASE}/shop/{shop_name}"
+    async with session.get(url) as resp:
+        html = await resp.text()
+    m = re.search(r'"(?:shopId|shop_id|deep_link_shop_id)"\s*:\s*"?(\d+)"?', html)
+    if m:
+        sid = m.group(1)
+        print(f"[API] Found shopId={sid} for {shop_name}")
+        return sid
+    else:
+        print(f"[API] Cannot find shopId for {shop_name}")
+        return None
+
+async def fetch_recent_listings(shop_name: str, cutoff: datetime, limit: int = 100) -> List[Dict[str, datetime]]:
+    listings = []
+    offset = 0
+
     async with aiohttp.ClientSession() as session:
-        async with session.get(listing_url) as resp:
-            html = await resp.text()
-    soup = BeautifulSoup(html, 'html.parser')
+        shop_id = await get_shop_id(session, shop_name)
+        if not shop_id:
+            return []
 
-    create_date = None
+        while True:
+            api = (
+                    f"{BASE}/api/v3/internal/shops/{shop_id}/listings/active"
+                    f"?limit={limit}&offset={offset}"
+                    "&sort_on=created&sort_order=desc"
+            )
+            print(f"[API] GET {api_url}")
+            async with session.get(api) as resp:
+                if resp.status != 200:
+                    print(f"[API] {shop_name} offset={offset} → HTTP {resp.status}")
+                    break
+                data = await resp.json()
+            results = data.get("results", [])
+            print(
+                f"[API] {shop_name}: fetched {len(results)} items "
+                f"(offset={offset})"
+                )
+            if not results:
+                break
 
-    time_tag = soup.find('time')
-    if time_tag and time_tag.has_attr('datetime'):
-        create_date = time_tag['datetime'].split('T')[0]
+            for item in results:
+                ts = item.get("creation_tsz")
+                if not ts:
+                    continue
+                created = datetime.fromtimestamp(ts, tz=timezone.utc)
+                if created < cutoff:
+                    return listings
+                listings.append({
+                    "listing_id": str(item["listing_id"]),
+                    "created": created
+                })
 
-    if not create_date:
-        meta_created = soup.find('meta', attrs={'property': 'etsym:original_publish_date'}) or \
-                       soup.find('meta', property='article:published_time')
-        if meta_created and meta_created.has_attr('content'):
-            create_date = meta_created['content'].split('T')[0]
+            offset += limit
 
-    price_tag = soup.find('meta', property='og:price:amount')
-    currency_tag = soup.find('meta', property='og:price:currency')
-    img_tag = soup.find('meta', property='og:image')
-
-    return {
-            'price': price_tag['content'] if price_tag else '?',
-            'currency': currency_tag['content'] if currency_tag else '',
-            'thumbnail': img_tag['content'] if img_tag else None,
-            'create_date': create_date or 'Unknown'
-    }
+    return listings
