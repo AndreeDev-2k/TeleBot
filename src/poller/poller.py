@@ -20,7 +20,7 @@ from notifier.telegram_client import send_message
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 
@@ -31,19 +31,23 @@ API_KEY = settings.API_KEY
 
 daily_counts: dict[str, int] = {}
 
+
 async def ensure_shop_table(pg, shop_id: int) -> str:
     table = f"listing_{shop_id}"
     # Drop and recreate table
     await pg.execute(f'DROP TABLE IF EXISTS "{table}";')
-    await pg.execute(f'''
+    await pg.execute(
+        f"""
         CREATE TABLE "{table}" (
             listing_id     TEXT PRIMARY KEY,
             url            TEXT,
             listing_images TEXT,
             created_at     TIMESTAMPTZ
         );
-    ''')
+    """
+    )
     return table
+
 
 async def fetch_new_listings(pg, shop_name: str, shop_id: int, cutoff: datetime) -> int:
     # Normalize cutoff to UTC-aware
@@ -74,12 +78,21 @@ async def fetch_new_listings(pg, shop_name: str, shop_id: int, cutoff: datetime)
                 logger.error(f"[{shop_name}] Listing API error {resp.status}: {text}")
                 break
             data = await resp.json()
-            items = data.get("results", []) or []
+            # Handle new API format: data is in 'data' field, not 'results'
+            if "data" in data and isinstance(data["data"], list):
+                items = data["data"]  # New format
+                metadata = data.get("metadata", {})
+            else:
+                items = data.get("results", []) or []  # Old format fallback
+                metadata = data.get("metadata", {})
+
             if not items:
                 break
             all_items.extend(items)
-            meta = data.get("metadata", {}).get("pagination", {})
-            if not meta.get("has_more"):
+
+            # Check pagination from metadata
+            meta = metadata.get("pagination", {})
+            if not meta.get("has_next", metadata.get("has_more", False)):
                 break
             offset += limit
 
@@ -91,7 +104,9 @@ async def fetch_new_listings(pg, shop_name: str, shop_id: int, cutoff: datetime)
             created = it.get("created_at")
             if not created:
                 continue
-            dt = datetime.fromisoformat(created.replace("Z", "+00:00")).replace(tzinfo=pytz.UTC)
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00")).replace(
+                tzinfo=pytz.UTC
+            )
             if dt >= last24:
                 recent.append((str(it.get("listing_id")), it.get("url"), dt))
         logger.info(f"[{shop_name}] {len(recent)} recent listings")
@@ -100,25 +115,36 @@ async def fetch_new_listings(pg, shop_name: str, shop_id: int, cutoff: datetime)
         for lid, url_field, dt in recent:
             # fetch listing images
             img_resp = await sess.get(
-                f"{API_BASE}/listing-images",
-                params={"listing_ids": lid}
+                f"{API_BASE}/listing-images", params={"listing_ids": lid}
             )
-            img_urls = None
+            img_url = ""
             if img_resp.status == 200:
                 j = await img_resp.json()
-                # API returns mapping listing_id -> list of image objects
-                mapping = j.get("results", {}).get("listing_images", {})
+                # Handle new API format for listing-images
+                if "data" in j and "listing_images" in j["data"]:
+                    mapping = j["data"]["listing_images"]  # New format
+                else:
+                    mapping = j.get("results", {}).get(
+                        "listing_images", {}
+                    )  # Old format fallback
+
                 imgs = mapping.get(lid, [])
                 if imgs:
                     img_url = imgs[0].get("url_570xN", "")
             else:
-                logger.warning(f"[{shop_name}] Images API {lid} failed: {img_resp.status}")
+                logger.warning(
+                    f"[{shop_name}] Images API {lid} failed: {img_resp.status}"
+                )
+
             img_str = img_url or ""
 
             try:
                 await pg.execute(
                     f"INSERT INTO {table} (listing_id, url, listing_images, created_at) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING;",
-                    lid, url_field, img_str, dt
+                    lid,
+                    url_field,
+                    img_str,
+                    dt,
                 )
                 new_count += 1
             except Exception as e:
@@ -126,6 +152,7 @@ async def fetch_new_listings(pg, shop_name: str, shop_id: int, cutoff: datetime)
 
     logger.info(f"[{shop_name}] Total new: {new_count}")
     return new_count
+
 
 async def collect_listings():
     pg = await init_pg_pool()
@@ -141,6 +168,7 @@ async def collect_listings():
         cnt = await fetch_new_listings(pg, name, sid, cutoff)
         daily_counts[name] = cnt
 
+
 async def send_daily_summary():
     pg = await init_pg_pool()
     label = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
@@ -150,7 +178,9 @@ async def send_daily_summary():
             cnt = daily_counts.get(name, 0)
             link = f"https://dakuho.com/topics/{gid}/shops/{sid}"
             lines.append(f"• {name}: {cnt} new [Xem thêm]({link})")
-        text = f"📊 *Daily Report {label}*\n\n" + ("\n".join(lines) if lines else "No subscriptions.")
+        text = f"📊 *Daily Report {label}*\n\n" + (
+            "\n".join(lines) if lines else "No subscriptions."
+        )
         await send_message(gid, text)
 
 
@@ -162,6 +192,6 @@ def main():
     sched.start()
     loop.run_forever()
 
+
 if __name__ == "__main__":
     main()
-
