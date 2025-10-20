@@ -1,12 +1,54 @@
 import asyncpg
+import asyncio
+import logging
 from typing import List, Tuple, Set
 from config.settings import settings
 
-async def init_pg_pool() -> asyncpg.Pool:
+logger = logging.getLogger(__name__)
+
+
+async def init_pg_pool(max_retries: int = 5, retry_delay: int = 2) -> asyncpg.Pool:
     """
-    Khởi tạo connection pool đến PostgreSQL.
+    Khởi tạo connection pool đến PostgreSQL với retry logic.
+
+    Args:
+        max_retries: Số lần thử lại tối đa
+        retry_delay: Thời gian chờ giữa các lần thử (giây)
+
+    Returns:
+        asyncpg.Pool: Connection pool
+
+    Raises:
+        Exception: Nếu không thể kết nối sau max_retries lần
     """
-    return await asyncpg.create_pool(dsn=settings.DATABASE_URL)
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(
+                f"Đang kết nối đến PostgreSQL (lần thử {attempt}/{max_retries})..."
+            )
+            pool = await asyncpg.create_pool(
+                dsn=settings.DATABASE_URL,
+                min_size=2,
+                max_size=10,
+                command_timeout=60,
+                timeout=30,  # Connection timeout
+                server_settings={
+                    "application_name": "telebot",
+                },
+            )
+            logger.info("✅ Kết nối PostgreSQL thành công!")
+            return pool
+        except (asyncio.TimeoutError, OSError, asyncpg.PostgresError) as e:
+            if attempt == max_retries:
+                logger.error(
+                    f"❌ Không thể kết nối PostgreSQL sau {max_retries} lần thử: {e}"
+                )
+                raise
+            logger.warning(
+                f"⚠️ Kết nối thất bại (lần {attempt}): {e}. Thử lại sau {retry_delay}s..."
+            )
+            await asyncio.sleep(retry_delay)
+
 
 # ── XỬ LÝ SHOPS ───────────────────────────────────────────────────────────────
 async def import_shops_from_csv(pg_pool, shops: List[Tuple[str, int]]) -> None:
@@ -21,18 +63,18 @@ async def import_shops_from_csv(pg_pool, shops: List[Tuple[str, int]]) -> None:
             ON CONFLICT (shop_name) DO UPDATE
               SET shop_id = EXCLUDED.shop_id;
             """,
-            shops
+            shops,
         )
+
 
 async def get_all_shops(pg_pool) -> List[Tuple[str, int]]:
     """
     Trả về toàn bộ danh sách shops.
     """
     async with pg_pool.acquire() as con:
-        rows = await con.fetch(
-            "SELECT shop_name, shop_id FROM shops;"
-        )
-    return [(r['shop_name'], r['shop_id']) for r in rows]
+        rows = await con.fetch("SELECT shop_name, shop_id FROM shops;")
+    return [(r["shop_name"], r["shop_id"]) for r in rows]
+
 
 # ── XỬ LÝ seen_ids ────────────────────────────────────────────────────────────
 async def ensure_seen_table(pg_pool) -> None:
@@ -51,6 +93,7 @@ async def ensure_seen_table(pg_pool) -> None:
             """
         )
 
+
 async def add_seen_id(pg_pool, shop_name: str, listing_id: str) -> bool:
     """
     Ghi nhận listing đã xem, trả về True nếu chèn mới.
@@ -62,10 +105,12 @@ async def add_seen_id(pg_pool, shop_name: str, listing_id: str) -> bool:
             VALUES ($1, $2)
             ON CONFLICT DO NOTHING;
             """,
-            shop_name, listing_id
+            shop_name,
+            listing_id,
         )
     # asyncpg.execute returns e.g. 'INSERT 0 1' if inserted
-    return result.split()[-1] == '1'
+    return result.split()[-1] == "1"
+
 
 async def get_seen_ids(pg_pool, shop_name: str) -> Set[str]:
     """
@@ -73,10 +118,10 @@ async def get_seen_ids(pg_pool, shop_name: str) -> Set[str]:
     """
     async with pg_pool.acquire() as con:
         rows = await con.fetch(
-            "SELECT listing_id FROM seen_ids WHERE shop_name = $1;",
-            shop_name
+            "SELECT listing_id FROM seen_ids WHERE shop_name = $1;", shop_name
         )
-    return {r['listing_id'] for r in rows}
+    return {r["listing_id"] for r in rows}
+
 
 # ── XỬ LÝ NHÓM & SUBSCRIPTIONS ─────────────────────────────────────────────────
 async def init_groups_tables(pg_pool) -> None:
@@ -96,7 +141,7 @@ async def init_groups_tables(pg_pool) -> None:
                 updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
                 deleted_at   TIMESTAMPTZ
             );
-            """  
+            """
         )
         # Bảng shops
         await con.execute(
@@ -138,8 +183,10 @@ async def add_group(pg_pool, chat_id: int, chat_title: str) -> None:
                 updated_at = now(),
                 deleted_at = NULL
             """,
-            chat_id, chat_title
+            chat_id,
+            chat_title,
         )
+
 
 async def subscribe_group(pg_pool, chat_id: int, shop_name: str, shop_id: int) -> None:
     """
@@ -148,8 +195,7 @@ async def subscribe_group(pg_pool, chat_id: int, shop_name: str, shop_id: int) -
     async with pg_pool.acquire() as con:
         # Đảm bảo group tồn tại
         await con.execute(
-            "INSERT INTO groups (chat_id) VALUES ($1) ON CONFLICT DO NOTHING;",
-            chat_id
+            "INSERT INTO groups (chat_id) VALUES ($1) ON CONFLICT DO NOTHING;", chat_id
         )
         # Đảm bảo shop tồn tại và cập nhật shop_id nếu cần
         await con.execute(
@@ -158,17 +204,21 @@ async def subscribe_group(pg_pool, chat_id: int, shop_name: str, shop_id: int) -
             VALUES ($1, $2)
             ON CONFLICT (shop_name) DO UPDATE SET shop_id = EXCLUDED.shop_id;
             """,
-            shop_name, shop_id
+            shop_name,
+            shop_id,
         )
         # Thêm subscription
         try:
             await con.execute(
                 "INSERT INTO group_subscriptions (chat_id, shop_name, shop_id) VALUES ($1, $2, $3);",
-                chat_id, shop_name, shop_id
+                chat_id,
+                shop_name,
+                shop_id,
             )
         except asyncpg.exceptions.UniqueViolationError:
             # subscription already exists
             pass
+
 
 async def unsubscribe_group(pg_pool, chat_id: int, shop_name: str) -> None:
     """
@@ -177,8 +227,10 @@ async def unsubscribe_group(pg_pool, chat_id: int, shop_name: str) -> None:
     async with pg_pool.acquire() as con:
         await con.execute(
             "DELETE FROM group_subscriptions WHERE chat_id = $1 AND shop_name = $2;",
-            chat_id, shop_name
+            chat_id,
+            shop_name,
         )
+
 
 async def get_shops_for_group(pg_pool, chat_id: int) -> List[Tuple[str, int]]:
     """
@@ -192,9 +244,10 @@ async def get_shops_for_group(pg_pool, chat_id: int) -> List[Tuple[str, int]]:
               JOIN shops s ON s.shop_name = gs.shop_name
              WHERE gs.chat_id = $1;
             """,
-            chat_id
+            chat_id,
         )
-    return [(r['shop_name'], r['shop_id']) for r in rows]
+    return [(r["shop_name"], r["shop_id"]) for r in rows]
+
 
 async def get_all_group_ids(pg_pool) -> List[int]:
     """
@@ -202,4 +255,4 @@ async def get_all_group_ids(pg_pool) -> List[int]:
     """
     async with pg_pool.acquire() as con:
         rows = await con.fetch("SELECT chat_id FROM groups;")
-    return [r['chat_id'] for r in rows]
+    return [r["chat_id"] for r in rows]
