@@ -74,7 +74,7 @@ async def cmd_import(message: types.Message):
 
     await import_shops_from_csv(pg, shops)
     for shop_name, shop_id in shops:
-        await subscribe_group(pg, chat_id, shop_name, shop_id)
+        await subscribe_group(pg, chat_id, shop_name, shop_id, chat_title)
 
     await message.reply(f"✅ Đã thêm và subscribe {len(shops)} shop. 5h thu thập & 6h báo cáo.")
 

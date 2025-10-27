@@ -188,15 +188,31 @@ async def add_group(pg_pool, chat_id: int, chat_title: str) -> None:
         )
 
 
-async def subscribe_group(pg_pool, chat_id: int, shop_name: str, shop_id: int) -> None:
+async def subscribe_group(pg_pool, chat_id: int, shop_name: str, shop_id: int, chat_title: str | None = None) -> None:
     """
     Đăng ký shop cho group.
     """
     async with pg_pool.acquire() as con:
-        # Đảm bảo group tồn tại
-        await con.execute(
-            "INSERT INTO groups (chat_id) VALUES ($1) ON CONFLICT DO NOTHING;", chat_id
-        )
+        # Đảm bảo group tồn tại với chat_title
+        if chat_title:
+            await con.execute(
+                """
+                INSERT INTO groups (chat_id, chat_title) 
+                VALUES ($1, $2) 
+                ON CONFLICT (chat_id) DO UPDATE SET 
+                    chat_title = EXCLUDED.chat_title,
+                    updated_at = now();
+                """,
+                chat_id,
+                chat_title,
+            )
+        else:
+            # Fallback: chỉ insert nếu chưa tồn tại, không update
+            await con.execute(
+                "INSERT INTO groups (chat_id, chat_title) VALUES ($1, $2) ON CONFLICT DO NOTHING;", 
+                chat_id, 
+                str(chat_id)
+            )
         # Đảm bảo shop tồn tại và cập nhật shop_id nếu cần
         await con.execute(
             """
