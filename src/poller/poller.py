@@ -2,6 +2,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 import sys
+import random
 
 import aiohttp
 import pytz
@@ -30,6 +31,80 @@ API_BASE = "https://service.sidcorp.co/api/v3/etsy"
 API_KEY = settings.API_KEY
 
 daily_counts: dict[str, int] = {}
+
+# Transient statuses - lỗi tạm thời cần retry
+TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 522, 523, 524}
+
+
+async def get_with_retries(
+    sess: aiohttp.ClientSession,
+    url: str,
+    *,
+    params: dict,
+    max_attempts: int = 5,
+    base_backoff: float = 1.0,
+    timeout: int = 30,
+):
+    """
+    GET request với retry logic cho lỗi tạm thời.
+    Trả về (status, data, is_json).
+    """
+    backoff = base_backoff
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = await sess.get(
+                url, params=params, timeout=aiohttp.ClientTimeout(total=timeout)
+            )
+            status = resp.status
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            is_json = "application/json" in ctype
+
+            if is_json:
+                try:
+                    data = await resp.json()
+                except Exception:
+                    # Server trả HTML nhưng header ghi json
+                    data = await resp.text()
+                    is_json = False
+            else:
+                data = await resp.text()
+
+            # Thành công hoặc lỗi không-transient → trả về
+            if status < 400 or status not in TRANSIENT_STATUSES:
+                return status, data, is_json
+
+            # Lỗi transient → retry
+            last_error = f"Status {status}"
+            logger.warning(
+                f"[Retry {attempt}/{max_attempts}] {url} -> {status}, "
+                f"waiting {backoff:.1f}s..."
+            )
+
+        except asyncio.TimeoutError as e:
+            last_error = f"Timeout: {e}"
+            logger.warning(
+                f"[Retry {attempt}/{max_attempts}] {url} timeout, "
+                f"waiting {backoff:.1f}s..."
+            )
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(
+                f"[Retry {attempt}/{max_attempts}] {url} error: {e}, "
+                f"waiting {backoff:.1f}s..."
+            )
+
+        if attempt < max_attempts:
+            # Exponential backoff + jitter
+            await asyncio.sleep(backoff + random.uniform(0, 0.5))
+            backoff = min(backoff * 2, 10.0)
+
+    # Hết retry attempts
+    logger.error(
+        f"Failed after {max_attempts} attempts: {url}. Last error: {last_error}"
+    )
+    return 503, {"error": f"Max retries exceeded. Last error: {last_error}"}, True
 
 
 async def ensure_shop_table(pg, shop_id: int) -> str:
@@ -71,13 +146,24 @@ async def fetch_new_listings(pg, shop_name: str, shop_id: int, cutoff: datetime)
                 "sort_order": "asc",
                 "state": "active",
             }
-            resp = await sess.get(f"{API_BASE}/listings", params=params)
-            logger.info(f"[{shop_name}] GET listings {params} -> {resp.status}")
-            if resp.status != 200:
-                text = await resp.text()
-                logger.error(f"[{shop_name}] Listing API error {resp.status}: {text}")
+
+            # Sử dụng retry logic
+            status, data, is_json = await get_with_retries(
+                sess, f"{API_BASE}/listings", params=params
+            )
+
+            logger.info(f"[{shop_name}] GET listings {params} -> {status}")
+
+            if status != 200:
+                error_msg = data if isinstance(data, str) else str(data)
+                logger.error(f"[{shop_name}] Listing API error {status}: {error_msg}")
                 break
-            data = await resp.json()
+
+            # Data phải là dict nếu is_json=True
+            if not is_json or not isinstance(data, dict):
+                logger.error(f"[{shop_name}] Invalid response format")
+                break
+
             # Handle new API format: data is in 'data' field, not 'results'
             if "data" in data and isinstance(data["data"], list):
                 items = data["data"]  # New format
@@ -91,9 +177,12 @@ async def fetch_new_listings(pg, shop_name: str, shop_id: int, cutoff: datetime)
             all_items.extend(items)
 
             # Check pagination from metadata
-            meta = metadata.get("pagination", {})
-            if not meta.get("has_next", metadata.get("has_more", False)):
-                break
+            if isinstance(metadata, dict):
+                meta = metadata.get("pagination", {})
+                if isinstance(meta, dict) and not meta.get(
+                    "has_next", metadata.get("has_more", False)
+                ):
+                    break
             offset += limit
 
         # Filter by created_at in last 24h
@@ -113,28 +202,36 @@ async def fetch_new_listings(pg, shop_name: str, shop_id: int, cutoff: datetime)
 
         # Insert with image URLs
         for lid, url_field, dt in recent:
-            # fetch listing images
-            img_resp = await sess.get(
-                f"{API_BASE}/listing-images", params={"listing_ids": lid}
+            # Fetch listing images với retry
+            img_status, img_data, img_is_json = await get_with_retries(
+                sess, f"{API_BASE}/listing-images", params={"listing_ids": lid}
             )
-            img_url = ""
-            if img_resp.status == 200:
-                j = await img_resp.json()
-                # Handle new API format for listing-images
-                if "data" in j and "listing_images" in j["data"]:
-                    mapping = j["data"]["listing_images"]  # New format
-                else:
-                    mapping = j.get("results", {}).get(
-                        "listing_images", {}
-                    )  # Old format fallback
 
-                imgs = mapping.get(lid, [])
-                if imgs:
-                    img_url = imgs[0].get("url_570xN", "")
+            img_url = ""
+            if img_status == 200 and img_is_json and isinstance(img_data, dict):
+                # Handle new API format for listing-images
+                mapping = {}
+                if "data" in img_data:
+                    data_dict = img_data.get("data")
+                    if isinstance(data_dict, dict) and "listing_images" in data_dict:
+                        listing_imgs = data_dict.get("listing_images")
+                        if isinstance(listing_imgs, dict):
+                            mapping = listing_imgs
+                elif "results" in img_data:
+                    results = img_data.get("results")
+                    if isinstance(results, dict):
+                        listing_imgs = results.get("listing_images")
+                        if isinstance(listing_imgs, dict):
+                            mapping = listing_imgs
+
+                if mapping:
+                    imgs = mapping.get(lid, [])
+                    if imgs and isinstance(imgs, list) and len(imgs) > 0:
+                        first_img = imgs[0]
+                        if isinstance(first_img, dict):
+                            img_url = first_img.get("url_570xN", "")
             else:
-                logger.warning(
-                    f"[{shop_name}] Images API {lid} failed: {img_resp.status}"
-                )
+                logger.warning(f"[{shop_name}] Images API {lid} failed: {img_status}")
 
             img_str = img_url or ""
 
