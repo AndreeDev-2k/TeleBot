@@ -130,21 +130,29 @@ async def fetch_new_listings(pg, shop_name: str, shop_id: int, cutoff: datetime)
         cutoff = cutoff.replace(tzinfo=pytz.UTC)
 
     headers = {"x-api-key": API_KEY, "Accept": "application/json"}
-    limit, offset = 100, 0
+    limit = 100
+    offset = 0
     new_count = 0
     table = await ensure_shop_table(pg, shop_id)
 
+    max_pages = 10
+    current_page = 0
+
+    # Tính thời gian 24h trước
+    now_utc = datetime.utcnow().replace(tzinfo=pytz.UTC)
+    last24 = now_utc - timedelta(hours=24)
+
     async with aiohttp.ClientSession(headers=headers) as sess:
-        all_items = []
-        # Pagination asc
-        while True:
+        recent = []
+
+        # Pagination với order=desc (mới nhất trước)
+        while current_page < max_pages:
             params = {
                 "shop_id": shop_id,
                 "offset": offset,
                 "limit": limit,
                 "sort_by": "created",
-                "sort_order": "asc",
-                "state": "active",
+                "order": "desc",  # Mới nhất trước để tối ưu
             }
 
             # Sử dụng retry logic
@@ -152,7 +160,10 @@ async def fetch_new_listings(pg, shop_name: str, shop_id: int, cutoff: datetime)
                 sess, f"{API_BASE}/listings", params=params
             )
 
-            logger.info(f"[{shop_name}] GET listings {params} -> {status}")
+            logger.info(
+                f"[{shop_name}] GET listings page {current_page + 1}/{max_pages} "
+                f"(offset={offset}) -> {status}"
+            )
 
             if status != 200:
                 error_msg = data if isinstance(data, str) else str(data)
@@ -173,32 +184,64 @@ async def fetch_new_listings(pg, shop_name: str, shop_id: int, cutoff: datetime)
                 metadata = data.get("metadata", {})
 
             if not items:
+                logger.info(f"[{shop_name}] No more items, stopping pagination")
                 break
-            all_items.extend(items)
 
-            # Check pagination from metadata
+            # Đếm listings mới và cũ trong page này
+            new_in_page = 0
+            old_in_page = 0
+
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+
+                created = it.get("created_at")
+                if not created:
+                    continue
+
+                try:
+                    dt = datetime.fromisoformat(created.replace("Z", "+00:00")).replace(
+                        tzinfo=pytz.UTC
+                    )
+
+                    if dt >= last24:
+                        # Listing mới trong 24h
+                        recent.append((str(it.get("listing_id")), it.get("url"), dt))
+                        new_in_page += 1
+                    else:
+                        # Listing cũ hơn 24h
+                        old_in_page += 1
+                except Exception as e:
+                    logger.debug(f"[{shop_name}] Parse date error: {e}")
+                    continue
+
+            logger.info(
+                f"[{shop_name}] Page {current_page + 1}: "
+                f"{new_in_page} new, {old_in_page} old listings"
+            )
+
+            # Check pagination từ metadata
+            has_more = False
             if isinstance(metadata, dict):
                 meta = metadata.get("pagination", {})
-                if isinstance(meta, dict) and not meta.get(
-                    "has_next", metadata.get("has_more", False)
-                ):
-                    break
-            offset += limit
+                if isinstance(meta, dict):
+                    has_more = meta.get("has_next", metadata.get("has_more", False))
 
-        # Filter by created_at in last 24h
-        now_utc = datetime.utcnow().replace(tzinfo=pytz.UTC)
-        last24 = now_utc - timedelta(hours=24)
-        recent = []
-        for it in all_items:
-            created = it.get("created_at")
-            if not created:
-                continue
-            dt = datetime.fromisoformat(created.replace("Z", "+00:00")).replace(
-                tzinfo=pytz.UTC
+            if not has_more:
+                logger.info(f"[{shop_name}] No more pages available")
+                break
+
+            offset += limit
+            current_page += 1
+
+        # Log tổng kết
+        if current_page >= max_pages:
+            logger.info(
+                f"[{shop_name}] Reached max pages limit ({max_pages}), "
+                f"checked {current_page * limit} listings total"
             )
-            if dt >= last24:
-                recent.append((str(it.get("listing_id")), it.get("url"), dt))
-        logger.info(f"[{shop_name}] {len(recent)} recent listings")
+
+        logger.info(f"[{shop_name}] Total {len(recent)} recent listings found")
 
         # Insert with image URLs
         for lid, url_field, dt in recent:
