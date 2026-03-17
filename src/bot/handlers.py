@@ -42,9 +42,12 @@ async def cmd_import(message: types.Message):
     """
     Xử lý /import + file CSV.
     """
-    if not message.document or not (message.caption or "").strip().lower().startswith(
-        "/import"
-    ):
+    caption = (
+        (message.caption or "").strip().lower().split()[0]
+        if (message.caption or "").strip()
+        else ""
+    )
+    if not message.document or caption != "/import":
         return
 
     pg = await init_pg_pool()
