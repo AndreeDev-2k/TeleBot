@@ -3,7 +3,10 @@ from datetime import datetime, timezone
 import aiohttp
 from typing import List, Dict, Optional
 
+from config.settings import settings
+
 BASE = "https://www.etsy.com"
+TOOLVN_FB_URL = "https://tool.vn/api/facebook/get-post-facebook"
 
 
 async def get_shop_id(session: aiohttp.ClientSession, shop_name: str) -> Optional[str]:
@@ -64,3 +67,37 @@ async def fetch_recent_listings(
             offset += limit
 
     return listings
+
+
+async def fetch_fb_posts(page_id: str, limit: int = 10) -> List[Dict]:
+    """
+    Lấy những bài đăng mới nhất từ Facebook fanpage qua API tool.vn.
+
+    tool.vn yêu cầu:
+      - POST tới URL có ?key=... (query string)
+      - Body dạng form-urlencoded: id=<page_id>&limit=<N>
+
+    Args:
+        page_id: Facebook page ID.
+        limit: Số lượng bài đăng cần lấy.
+
+    Returns:
+        Danh sách các bài đăng (mỗi bài là một dict).
+    """
+    url = f"{TOOLVN_FB_URL}?key={settings.TOOLVN_API_KEY}"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            url,
+            data={"id": page_id, "limit": limit},
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json(content_type=None)
+
+    # Response structure: {"status": "success", "posts": [...]}
+    if isinstance(data, dict) and "posts" in data:
+        return data["posts"]
+    if isinstance(data, list):
+        return data
+    return []

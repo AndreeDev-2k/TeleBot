@@ -14,7 +14,11 @@ from db.postgres import (
     get_all_group_ids,
     get_shops_for_group,
     ensure_seen_table,
+    init_fb_tables,
+    get_all_fb_page_subscriptions,
+    save_fb_post,
 )
+from api.client import fetch_fb_posts
 from notifier.telegram_client import send_message
 
 # Setup logging
@@ -324,10 +328,181 @@ async def send_daily_summary():
         await send_message(gid, text)
 
 
+def _format_fb_post(post: dict, page_name: str) -> str:
+    """
+    Định dạng bài đăng Facebook (từ tool.vn) thành message Telegram.
+
+    Cấu trúc response tool.vn:
+      - strong_id__: ID số của post (dùng để dedup)
+      - message.text: nội dung văn bản
+      - creation_time: Unix timestamp
+      - url: link trực tiếp đến bài viết
+    """
+    from datetime import datetime
+
+    TZ_VN = pytz.timezone("Asia/Bangkok")
+
+    # Nội dung bài viết
+    msg_field = post.get("message")
+    if isinstance(msg_field, dict):
+        text = msg_field.get("text", "")
+    else:
+        text = msg_field or ""
+
+    # Thời gian đăng
+    ts = post.get("creation_time")
+    if ts:
+        try:
+            created_str = datetime.fromtimestamp(int(ts), tz=TZ_VN).strftime(
+                "%d/%m/%Y %H:%M"
+            )
+        except Exception:
+            created_str = str(ts)
+    else:
+        created_str = ""
+
+    # URL bài viết
+    link = post.get("url") or post.get("permalink_url") or ""
+
+    lines = [f"📢 *{page_name}*"]
+    if created_str:
+        lines.append(f"🕐 {created_str}")
+    if text:
+        preview = text[:800] + "…" if len(text) > 800 else text
+        lines.append(f"\n{preview}")
+    if link:
+        lines.append(f"\n🔗 [Xem bài đăng]({link})")
+
+    return "\n".join(lines)
+
+
+async def poll_fb_pages():
+    """Lấy bài đăng ngày hôm qua từ các Facebook fanpage và gửi thông báo."""
+    logger.info("[FB] Bắt đầu poll Facebook pages...")
+    pg = await init_pg_pool()
+    await init_fb_tables(pg)
+
+    all_subs = await get_all_fb_page_subscriptions(pg)
+    if not all_subs:
+        logger.info("[FB] Chưa có subscription nào.")
+        return
+
+    # Tính khoảng thời gian "hôm qua" theo múi giờ Asia/Bangkok
+    today_local = datetime.now(TZ).date()
+    yesterday_local = today_local - timedelta(days=1)
+    yesterday_start = TZ.localize(
+        datetime(
+            yesterday_local.year, yesterday_local.month, yesterday_local.day, 0, 0, 0
+        )
+    )
+    yesterday_end = TZ.localize(
+        datetime(today_local.year, today_local.month, today_local.day, 0, 0, 0)
+    )
+    logger.info(
+        f"[FB] Chỉ lấy bài đăng ngày {yesterday_local} ({yesterday_start} → {yesterday_end})"
+    )
+
+    # Gom theo page_id để mỗi page chỉ fetch 1 lần
+    pages: dict[str, dict] = {}
+    for chat_id, page_id, page_name in all_subs:
+        if page_id not in pages:
+            pages[page_id] = {"page_name": page_name, "chat_ids": []}
+        pages[page_id]["chat_ids"].append(chat_id)
+
+    for page_id, info in pages.items():
+        page_name = info["page_name"]
+        try:
+            posts = await fetch_fb_posts(page_id, limit=50)
+            logger.info(
+                f"[FB] Page '{page_name}' ({page_id}): {len(posts)} posts fetched"
+            )
+        except Exception as e:
+            logger.error(f"[FB] Lỗi khi fetch page '{page_name}' ({page_id}): {e}")
+            continue
+
+        new_count = 0
+        for post in posts:
+            post_id = str(
+                post.get("strong_id__") or post.get("post_id") or post.get("id") or ""
+            )
+            if not post_id:
+                continue
+
+            # ── Thời gian đăng ──────────────────────────────────────────────
+            ts = post.get("creation_time")
+            created_at = None
+            if ts:
+                try:
+                    created_at = datetime.fromtimestamp(int(ts), tz=pytz.UTC)
+                except Exception:
+                    pass
+
+            # Chỉ lưu bài đăng trong ngày hôm qua; bỏ qua nếu không có timestamp
+            if created_at is None:
+                continue
+            if not (yesterday_start <= created_at < yesterday_end):
+                continue
+
+            # ── Nội dung văn bản ─────────────────────────────────────────────
+            msg_field = post.get("message")
+            message = (
+                msg_field.get("text", "")
+                if isinstance(msg_field, dict)
+                else (msg_field or "")
+            )
+
+            # ── Ảnh đầu tiên từ attachments ──────────────────────────────────
+            image_url = ""
+            for att in post.get("attachments") or []:
+                if not isinstance(att, dict):
+                    continue
+                media = att.get("media") or {}
+                img = media.get("image") or {}
+                uri = img.get("uri", "")
+                if uri:
+                    image_url = uri
+                    break
+
+            # ── URL bài viết ─────────────────────────────────────────────────
+            post_url = post.get("url") or post.get("permalink_url") or ""
+
+            # ── Tương tác ────────────────────────────────────────────────────
+            feedback = post.get("feedback") or {}
+            reaction_count = int(feedback.get("reaction_count") or 0)
+            comment_count_obj = feedback.get("comment_count") or {}
+            comment_count = int(
+                comment_count_obj.get("total_count") or 0
+                if isinstance(comment_count_obj, dict)
+                else comment_count_obj or 0
+            )
+
+            is_new = await save_fb_post(
+                pg,
+                page_id,
+                post_id,
+                page_name,
+                created_at,
+                message,
+                image_url,
+                post_url,
+                reaction_count,
+                comment_count,
+            )
+            if is_new:
+                new_count += 1
+
+        logger.info(
+            f"[FB] Page '{page_name}': {new_count} bài mới đã lưu vào fb_posts."
+        )
+
+    logger.info("[FB] Hoàn thành thu thập bài đăng Facebook.")
+
+
 def main():
     loop = asyncio.get_event_loop()
     sched = AsyncIOScheduler(event_loop=loop, timezone="Asia/Bangkok")
     sched.add_job(collect_listings, "cron", hour=5, minute=0)
+    sched.add_job(poll_fb_pages, "cron", hour=5, minute=30)
     sched.add_job(send_daily_summary, "cron", hour=6, minute=0)
     sched.start()
     loop.run_forever()

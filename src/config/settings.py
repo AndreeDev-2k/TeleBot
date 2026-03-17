@@ -3,11 +3,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
 class Settings:
-    BOT_TOKEN: str    = os.getenv('BOT_TOKEN', '')
-    DATABASE_URL: str = os.getenv('DATABASE_URL', '')
-    REDIS_URL: str    = os.getenv('REDIS_URL', '')
+    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+    REDIS_URL: str = os.getenv("REDIS_URL", "")
     API_KEY: str = os.getenv("API_KEY", "")
+    TOOLVN_API_KEY: str = os.getenv(
+        "TOOLVN_API_KEY", ""
+    )  # tool.vn API key for Facebook posts
+
 
 settings = Settings()
-
