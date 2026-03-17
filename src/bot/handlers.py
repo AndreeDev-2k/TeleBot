@@ -38,16 +38,27 @@ async def cmd_start(message: types.Message):
     )
 
 
-async def cmd_import(message: types.Message):
+async def _get_caption_cmd(message: types.Message) -> str:
+    """Trả về lệnh đầu tiên trong caption (vd: '/importfb'), chữ thường."""
+    raw = (message.caption or "").strip()
+    return raw.lower().split()[0] if raw else ""
+
+
+async def cmd_document(message: types.Message):
+    """Handler duy nhất cho mọi tin nhắn gửi kèm file — điều phối theo caption."""
+    cmd = await _get_caption_cmd(message)
+    if cmd == "/import":
+        await _handle_import(message)
+    elif cmd == "/importfb":
+        await _handle_importfb(message)
+    # caption khác → bỏ qua
+
+
+async def _handle_import(message: types.Message):
     """
-    Xử lý /import + file CSV.
+    Xử lý /import + file CSV (Etsy shops).
     """
-    caption = (
-        (message.caption or "").strip().lower().split()[0]
-        if (message.caption or "").strip()
-        else ""
-    )
-    if not message.document or caption != "/import":
+    if not message.document:
         return
 
     pg = await init_pg_pool()
@@ -128,14 +139,12 @@ async def cmd_list(message: types.Message):
     await message.reply(text)
 
 
-async def cmd_importfb(message: types.Message):
+async def _handle_importfb(message: types.Message):
     """
     /importfb + đính kèm file CSV có 2 cột: page_id, page_name
     Đăng ký theo dõi nhiều Facebook fanpage cùng lúc.
     """
-    if not message.document or not (message.caption or "").strip().lower().startswith(
-        "/importfb"
-    ):
+    if not message.document:
         return
 
     pg = await init_pg_pool()
@@ -253,10 +262,9 @@ async def cmd_listfb(message: types.Message):
 
 def register_handlers(dp: Dispatcher):
     dp.register_message_handler(cmd_start, commands=["start"])
-    dp.register_message_handler(cmd_import, content_types=["document"])
+    dp.register_message_handler(cmd_document, content_types=["document"])
     dp.register_message_handler(cmd_unsubscribe, commands=["unsubscribe"])
     dp.register_message_handler(cmd_list, commands=["list"])
     dp.register_message_handler(cmd_addfb, commands=["addfb"])
-    dp.register_message_handler(cmd_importfb, content_types=["document"])
     dp.register_message_handler(cmd_removefb, commands=["removefb"])
     dp.register_message_handler(cmd_listfb, commands=["listfb"])
