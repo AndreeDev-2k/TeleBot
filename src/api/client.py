@@ -1,9 +1,13 @@
+import asyncio
+import logging
 import re
 from datetime import datetime, timezone
 import aiohttp
 from typing import List, Dict, Optional
 
 from config.settings import settings
+
+logger = logging.getLogger(__name__)
 
 BASE = "https://www.etsy.com"
 TOOLVN_FB_URL = "https://tool.vn/api/facebook/get-post-facebook"
@@ -85,19 +89,42 @@ async def fetch_fb_posts(page_id: str, limit: int = 10) -> List[Dict]:
         Danh sách các bài đăng (mỗi bài là một dict).
     """
     url = f"{TOOLVN_FB_URL}?key={settings.TOOLVN_API_KEY}"
+    max_attempts = 3
+    backoff = 2.0
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            url,
-            data={"id": page_id, "limit": limit},
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            resp.raise_for_status()
-            data = await resp.json(content_type=None)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    data={"id": page_id, "limit": limit},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json(content_type=None)
 
-    # Response structure: {"status": "success", "posts": [...]}
-    if isinstance(data, dict) and "posts" in data:
-        return data["posts"]
-    if isinstance(data, list):
-        return data
-    return []
+            # Response structure: {"status": "success", "posts": [...]}
+            if isinstance(data, dict) and "posts" in data:
+                return data["posts"]
+            if isinstance(data, list):
+                return data
+            logger.warning(
+                f"[FB] Unexpected response format for page {page_id}: {str(data)[:200]}"
+            )
+            return []
+
+        except (asyncio.TimeoutError, aiohttp.ServerConnectionError, aiohttp.ServerDisconnectedError) as e:
+            logger.warning(
+                f"[FB] Attempt {attempt}/{max_attempts} transient error for page {page_id}: "
+                f"{type(e).__name__}: {e}"
+            )
+            if attempt < max_attempts:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+            else:
+                raise
+        except aiohttp.ClientResponseError as e:
+            logger.error(
+                f"[FB] HTTP error {e.status} for page {page_id}: {e.message}"
+            )
+            raise

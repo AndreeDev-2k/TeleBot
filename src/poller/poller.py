@@ -417,7 +417,11 @@ async def poll_fb_pages():
                 f"[FB] Page '{page_name}' ({page_id}): {len(posts)} posts fetched"
             )
         except Exception as e:
-            logger.error(f"[FB] Lỗi khi fetch page '{page_name}' ({page_id}): {e}")
+            logger.error(
+                f"[FB] Lỗi khi fetch page '{page_name}' ({page_id}): "
+                f"{type(e).__name__}: {e}",
+                exc_info=True,
+            )
             continue
 
         new_count = 0
