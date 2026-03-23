@@ -18,7 +18,7 @@ from db.postgres import (
     get_all_fb_page_subscriptions,
     save_fb_post,
 )
-from api.client import fetch_fb_posts
+from api.client import fetch_fb_posts, create_toolvn_session
 from notifier.telegram_client import send_message
 
 # Setup logging
@@ -377,7 +377,7 @@ def _format_fb_post(post: dict, page_name: str) -> str:
 
 
 async def poll_fb_pages():
-    """Lấy bài đăng ngày hôm qua từ các Facebook fanpage và gửi thông báo."""
+    """Quét bài đăng mới từ các Facebook fanpage trong 6 giờ gần nhất."""
     logger.info("[FB] Bắt đầu poll Facebook pages...")
     pg = await init_pg_pool()
     await init_fb_tables(pg)
@@ -387,19 +387,11 @@ async def poll_fb_pages():
         logger.info("[FB] Chưa có subscription nào.")
         return
 
-    # Tính khoảng thời gian "hôm qua" theo múi giờ Asia/Bangkok
-    today_local = datetime.now(TZ).date()
-    yesterday_local = today_local - timedelta(days=1)
-    yesterday_start = TZ.localize(
-        datetime(
-            yesterday_local.year, yesterday_local.month, yesterday_local.day, 0, 0, 0
-        )
-    )
-    yesterday_end = TZ.localize(
-        datetime(today_local.year, today_local.month, today_local.day, 0, 0, 0)
-    )
+    # Lấy bài đăng trong 6 giờ gần nhất (UTC)
+    now_utc = datetime.now(pytz.UTC)
+    window_start_utc = now_utc - timedelta(hours=6)
     logger.info(
-        f"[FB] Chỉ lấy bài đăng ngày {yesterday_local} ({yesterday_start} → {yesterday_end})"
+        f"[FB] Chỉ lấy bài đăng từ {window_start_utc.isoformat()} đến {now_utc.isoformat()}"
     )
 
     # Gom theo page_id để mỗi page chỉ fetch 1 lần
@@ -409,22 +401,47 @@ async def poll_fb_pages():
             pages[page_id] = {"page_name": page_name, "chat_ids": []}
         pages[page_id]["chat_ids"].append(chat_id)
 
+    # limit=3 → chi phí tối thiểu 30 credits/page/lần gọi
+    # 6h/lần, hầu hết page đăng ≤3 bài trong 6h
+    FB_FETCH_LIMIT = 3
+    MAX_CONCURRENT = 3  # Chạy tối đa 3 page song song
+    total_pages = len(pages)
+    estimated_credits = total_pages * 30
+    logger.info(
+        f"[FB] Quét {total_pages} pages, limit={FB_FETCH_LIMIT}/page, "
+        f"concurrency={MAX_CONCURRENT}, "
+        f"ước tính ~{estimated_credits} credits cho lần quét này"
+    )
+
+    sem = asyncio.Semaphore(MAX_CONCURRENT)
+    results: dict[str, list] = {}  # page_id → posts
+
+    async def _fetch_one(pid: str, pname: str, sess: aiohttp.ClientSession):
+        async with sem:
+            try:
+                posts = await fetch_fb_posts(pid, limit=FB_FETCH_LIMIT, session=sess)
+                results[pid] = posts
+                logger.info(
+                    f"[FB] Page '{pname}' ({pid}): {len(posts)} posts fetched"
+                )
+            except Exception as e:
+                results[pid] = []
+                logger.error(f"[FB] Lỗi khi fetch page '{pname}' ({pid}): {e}")
+
+    # Dùng chung 1 session cho tất cả requests (tái sử dụng TCP connections)
+    async with create_toolvn_session() as shared_session:
+        tasks = [
+            _fetch_one(page_id, info["page_name"], shared_session)
+            for page_id, info in pages.items()
+        ]
+        await asyncio.gather(*tasks)
+
+    # Xử lý kết quả và lưu vào DB
     for page_id, info in pages.items():
         page_name = info["page_name"]
-        try:
-            posts = await fetch_fb_posts(page_id, limit=50)
-            logger.info(
-                f"[FB] Page '{page_name}' ({page_id}): {len(posts)} posts fetched"
-            )
-        except Exception as e:
-            logger.error(
-                f"[FB] Lỗi khi fetch page '{page_name}' ({page_id}): "
-                f"{type(e).__name__}: {e}",
-                exc_info=True,
-            )
-            continue
-
+        posts = results.get(page_id, [])
         new_count = 0
+
         for post in posts:
             post_id = str(
                 post.get("strong_id__") or post.get("post_id") or post.get("id") or ""
@@ -441,10 +458,10 @@ async def poll_fb_pages():
                 except Exception:
                     pass
 
-            # Chỉ lưu bài đăng trong ngày hôm qua; bỏ qua nếu không có timestamp
+            # Chỉ lưu bài đăng trong 6 giờ gần nhất; bỏ qua nếu không có timestamp
             if created_at is None:
                 continue
-            if not (yesterday_start <= created_at < yesterday_end):
+            if not (window_start_utc <= created_at <= now_utc):
                 continue
 
             # ── Nội dung văn bản ─────────────────────────────────────────────
@@ -495,18 +512,23 @@ async def poll_fb_pages():
             if is_new:
                 new_count += 1
 
-        logger.info(
-            f"[FB] Page '{page_name}': {new_count} bài mới đã lưu vào fb_posts."
-        )
+        if new_count > 0:
+            logger.info(
+                f"[FB] Page '{page_name}': {new_count} bài mới đã lưu vào fb_posts."
+            )
 
-    logger.info("[FB] Hoàn thành thu thập bài đăng Facebook.")
+    logger.info(
+        f"[FB] Hoàn thành thu thập Facebook. "
+        f"Đã quét {total_pages} pages, tiêu tốn ~{estimated_credits} credits."
+    )
 
 
 def main():
     loop = asyncio.get_event_loop()
     sched = AsyncIOScheduler(event_loop=loop, timezone="Asia/Bangkok")
     sched.add_job(collect_listings, "cron", hour=5, minute=0)
-    sched.add_job(poll_fb_pages, "cron", hour=5, minute=30)
+    # Chạy quét fanpage mỗi 6 tiếng: 00:00, 06:00, 12:00, 18:00
+    sched.add_job(poll_fb_pages, "cron", hour="*/6", minute=0)
     sched.add_job(send_daily_summary, "cron", hour=6, minute=0)
     sched.start()
     loop.run_forever()
